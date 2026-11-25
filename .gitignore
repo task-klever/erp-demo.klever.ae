@@ -1,0 +1,26 @@
+# Python virtualenv (rebuild with: bench setup env)
+env/
+
+# Dependencies & build output (rebuild with: bench setup requirements / bench build)
+node_modules/
+sites/assets/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Secrets - NEVER commit
+sites/*/site_config.json
+config/*.acl
+
+# Runtime files
+logs/
+sites/*/logs/
+sites/*/locks/
+sites/*/private/
+sites/*/indexes/
+sites/*/*.temp.db
+config/pids/
+*.pid
+*.sock
+*.lock
+flow-server/

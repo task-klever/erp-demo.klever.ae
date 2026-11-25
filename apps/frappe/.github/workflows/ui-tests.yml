@@ -1,0 +1,169 @@
+name: UI
+
+on:
+  pull_request:
+  merge_group:
+  repository_dispatch:
+    types: [frappe-framework-change]
+  workflow_dispatch:
+  schedule:
+    # Run everday at midnight UTC / 5:30 IST
+    - cron: "0 0 * * *"
+
+concurrency:
+  group: ui-develop-${{ github.event_name }}-${{ github.event.number || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  # Do not change this as GITHUB_TOKEN is being used by roulette
+  contents: read
+
+jobs:
+  checkrun:
+    name: Plan Tests
+    runs-on: ubuntu-latest
+
+    outputs:
+      build: ${{ steps.check-build.outputs.build }}
+      studio: ${{ steps.check-build.outputs.studio }}
+      flow: ${{ steps.check-build.outputs.flow }}
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Check if build should be run
+        id: check-build
+        run: |
+          python "${GITHUB_WORKSPACE}/.github/helper/roulette.py"
+        env:
+          TYPE: "ui"
+          PR_NUMBER: ${{ github.event.number }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          REPO_NAME: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    name: Tests (Cypress)
+    uses: ./.github/workflows/_base-ui-tests.yml
+    with:
+      parallel-runs: 3
+      enable-coverage: ${{ !contains(fromJSON('["pull_request", "merge_group"]'), github.event_name) }}
+      fake-success: ${{ needs.checkrun.outputs.build != 'strawberry' }}
+    needs: checkrun
+
+  coverage:
+    name: Coverage Wrap Up
+    needs: [test, checkrun]
+    if: ${{ !contains(fromJSON('["pull_request", "merge_group"]'), github.event_name) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+      - name: Download artifacts
+        uses: actions/download-artifact@v7.0.0
+      - name: Upload python coverage data
+        uses: codecov/codecov-action@v5
+        with:
+          name: UIBackend
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+          verbose: true
+          flags: server-ui
+
+  studio:
+    name: Studio Component Tests
+    needs: checkrun
+    if: ${{ needs.checkrun.outputs.studio == 'strawberry' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # not NODE_ENV=production: yarn would skip the editor's devDependencies, cypress included
+      PYTHONWARNINGS: "ignore"
+      DB_ROOT_PASSWORD: db_root
+    services:
+      mariadb:
+        image: mariadb:11.8
+        ports:
+          - 3306:3306
+        options: --health-cmd="healthcheck.sh --connect --innodb_initialized" --health-interval=5s --health-timeout=2s --health-retries=3 --tmpfs=/var/lib/mysql:rw,noexec,nosuid,size=2g
+        env:
+          MARIADB_ROOT_PASSWORD: ${{ env.DB_ROOT_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Cache Cypress binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Cypress
+          key: ${{ runner.os }}-cypress-${{ hashFiles('studio/frontend/yarn.lock') }}
+
+      - uses: ./.github/actions/setup
+        name: Environment Setup
+        with:
+          python-version: '3.14'
+          node-version: 24
+          build-assets: true
+          disable-socketio: true
+          db-root-password: ${{ env.DB_ROOT_PASSWORD }}
+          db: mariadb
+
+      - name: Install Cypress binary
+        env:
+          CYPRESS_INSTALL_BINARY: ""
+        run: |
+          cd ${GITHUB_WORKSPACE}/apps/${{ github.event.repository.name }}/studio/frontend
+          yarn cypress install
+
+      # node --test alone: the vite plugins run in node and need no site
+      - name: Run Vite Plugin Tests
+        run: |
+          cd ${GITHUB_WORKSPACE}/apps/${{ github.event.repository.name }}/studio/frontend
+          yarn test:node
+
+      # the data-source specs call the test site through the dev server's proxy
+      - name: Run Component Tests
+        run: |
+          cd ${GITHUB_WORKSPACE}/apps/${{ github.event.repository.name }}/studio/frontend
+          yarn test:cypress
+
+      - name: Upload Cypress screenshots
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cypress-screenshots
+          path: apps/${{ github.event.repository.name }}/studio/frontend/cypress/screenshots
+
+      - name: Show bench output
+        if: ${{ always() }}
+        run: |
+          cat bench_start.log || true
+
+  flow:
+    name: Flow Page Tests
+    needs: checkrun
+    if: ${{ needs.checkrun.outputs.flow == 'strawberry' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: yarn
+          cache-dependency-path: flow/yarn.lock
+
+      # node --test alone: the page's tests need no site
+      - name: Run Page Tests
+        run: |
+          cd flow
+          yarn install --frozen-lockfile
+          yarn test
+
+      - name: Build the Page
+        run: |
+          mkdir -p "${RUNNER_TEMP}/bench/sites" "${RUNNER_TEMP}/bench/apps"
+          cd flow
+          FRAPPE_BENCH_ROOT="${RUNNER_TEMP}/bench" yarn build
